@@ -3,6 +3,7 @@ name = "interpulation-flat-matrix-benchmark"
 version = "0.1.0"
 edition = "2024"
 
+
 [dependencies]
 ndarray = "0.16.1"
 ninterp = "0.7.3"
