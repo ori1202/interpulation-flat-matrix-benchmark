@@ -74,7 +74,7 @@ fn nearest_neighbor_interp(
 
 #[test]
 fn compare_interpolation_speeds_with_ninterp() {
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     use ninterp::prelude::*;
 
     let m = 50;
