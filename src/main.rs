@@ -182,3 +182,65 @@ fn compare_interpolation_speeds_with_ninterp() {
         t3
     );
 }
+
+#[test]
+fn test_trilinear_known_answers() {
+    use ninterp::prelude::*;
+
+    let a_vals = vec![0.0, 1.0, 2.0];
+    let b_vals = vec![0.0, 1.0, 2.0];
+    let c_vals = vec![0.0, 1.0, 2.0];
+
+    // Define f(a, b, c) = a + b + c
+    let mut data = vec![0.0; a_vals.len() * b_vals.len() * c_vals.len()];
+    for i in 0..a_vals.len() {
+        for j in 0..b_vals.len() {
+            for k in 0..c_vals.len() {
+                data[i * b_vals.len() * c_vals.len() + j * c_vals.len() + k] =
+                    a_vals[i] + b_vals[j] + c_vals[k];
+            }
+        }
+    }
+
+    // Build ninterp interpolator
+    let interp3d = Interp3D::new(
+        ndarray::Array1::from(a_vals.clone()),
+        ndarray::Array1::from(b_vals.clone()),
+        ndarray::Array1::from(c_vals.clone()),
+        ndarray::Array::from_shape_vec((a_vals.len(), b_vals.len(), c_vals.len()), data.clone()).unwrap(),
+        strategy::Linear,
+        Extrapolate::Error,
+    )
+    .expect("Interp3D::new should succeed");
+
+    // Test points with known answers
+    let test_points = vec![
+        ([0.0, 0.0, 0.0], 0.0),
+        ([1.0, 1.0, 1.0], 3.0),
+        ([2.0, 2.0, 2.0], 6.0),
+        ([0.5, 0.5, 0.5], 1.5),
+        ([1.5, 0.5, 0.5], 2.5),
+    ];
+
+    for (pt, expected) in test_points {
+        let val_custom = trilinear_interp(&a_vals, &b_vals, &c_vals, &data, 3, 3, 3, pt[0], pt[1], pt[2]);
+        let val_ninterp = interp3d.interpolate(&pt).unwrap();
+
+        println!("point={:?}, expected={}, custom={}, ninterp={}", pt, expected, val_custom, val_ninterp);
+
+        assert!(
+            (val_custom - expected).abs() < 1e-9,
+            "Custom trilinear mismatch at {:?}: got {}, expected {}",
+            pt,
+            val_custom,
+            expected
+        );
+        assert!(
+            (val_ninterp - expected).abs() < 1e-9,
+            "ninterp mismatch at {:?}: got {}, expected {}",
+            pt,
+            val_ninterp,
+            expected
+        );
+    }
+}
