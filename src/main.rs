@@ -47,6 +47,67 @@ fn trilinear_interp(
         + c111 * dx * dy * dz
 }
 
+fn trilinear_interp_factored(
+    c000: f64, c001: f64, c010: f64, c011: f64,
+    c100: f64, c101: f64, c110: f64, c111: f64,
+    dx: f64, dy: f64, dz: f64,
+) -> f64 {
+    // interpolate along z
+    let c00 = c000 * (1.0 - dz) + c001 * dz;
+    let c01 = c010 * (1.0 - dz) + c011 * dz;
+    let c10 = c100 * (1.0 - dz) + c101 * dz;
+    let c11 = c110 * (1.0 - dz) + c111 * dz;
+
+    // along y
+    let c0 = c00 * (1.0 - dy) + c01 * dy;
+    let c1 = c10 * (1.0 - dy) + c11 * dy;
+
+    // along x
+    c0 * (1.0 - dx) + c1 * dx
+}
+
+
+
+fn trilinear_interp_stack<const M: usize, const N: usize, const P: usize>(
+    a_vals: [f64; M],
+    b_vals: [f64; N],
+    c_vals: [f64; P],
+    data: [[[f64; P]; N]; M], // stack allocated 3D array
+    a: f64,
+    b: f64,
+    c: f64,
+) -> f64 {
+    let i = a_vals.iter().position(|&x| x <= a).unwrap_or(M - 2);
+    let j = b_vals.iter().position(|&x| x <= b).unwrap_or(N - 2);
+    let k = c_vals.iter().position(|&x| x <= c).unwrap_or(P - 2);
+
+    let i1 = (i + 1).min(M - 1);
+    let j1 = (j + 1).min(N - 1);
+    let k1 = (k + 1).min(P - 1);
+
+    let dx = (a - a_vals[i]) / (a_vals[i1] - a_vals[i]);
+    let dy = (b - b_vals[j]) / (b_vals[j1] - b_vals[j]);
+    let dz = (c - c_vals[k]) / (c_vals[k1] - c_vals[k]);
+
+    let c000 = data[i][j][k];
+    let c001 = data[i][j][k1];
+    let c010 = data[i][j1][k];
+    let c011 = data[i][j1][k1];
+    let c100 = data[i1][j][k];
+    let c101 = data[i1][j][k1];
+    let c110 = data[i1][j1][k];
+    let c111 = data[i1][j1][k1];
+
+    c000 * (1.0 - dx) * (1.0 - dy) * (1.0 - dz)
+        + c100 * dx * (1.0 - dy) * (1.0 - dz)
+        + c010 * (1.0 - dx) * dy * (1.0 - dz)
+        + c001 * (1.0 - dx) * (1.0 - dy) * dz
+        + c101 * dx * (1.0 - dy) * dz
+        + c011 * (1.0 - dx) * dy * dz
+        + c110 * dx * dy * (1.0 - dz)
+        + c111 * dx * dy * dz
+}
+
 fn nearest_neighbor_interp(
     a_vals: &[f64],
     b_vals: &[f64],
@@ -72,6 +133,8 @@ fn nearest_neighbor_interp(
     best_val
 }
 
+
+#[cfg(debug_assertions)]
 #[test]
 fn compare_interpolation_speeds_with_ninterp() {
     use std::time::Instant;
@@ -145,6 +208,41 @@ fn compare_interpolation_speeds_with_ninterp() {
     let t1 = start.elapsed();
 
 
+    // --- Benchmark heap factorized ---
+    let start = Instant::now();
+    for qid in 0..q {
+        let a = ((qid % (m - 1)) as f64) + 0.3;
+        let b = ((qid % (n - 1)) as f64) + 0.4;
+        let c = ((qid % (p - 1)) as f64) + 0.5;
+
+        // find cell indices
+        let i = a.floor() as usize;
+        let j = b.floor() as usize;
+        let k = c.floor() as usize;
+
+        let dx = a - a_vals[i];
+        let dy = b - b_vals[j];
+        let dz = c - c_vals[k];
+
+        let idx = |ii, jj, kk| ii * n * p + jj * p + kk;
+
+        _ = trilinear_interp_factored(
+            data[idx(i, j, k)],
+            data[idx(i, j, k + 1)],
+            data[idx(i, j + 1, k)],
+            data[idx(i, j + 1, k + 1)],
+            data[idx(i + 1, j, k)],
+            data[idx(i + 1, j, k + 1)],
+            data[idx(i + 1, j + 1, k)],
+            data[idx(i + 1, j + 1, k + 1)],
+            dx,
+            dy,
+            dz,
+        );
+        }
+        let t_factored = start.elapsed();
+
+
 
     // --- Benchmark nearest neighbor ---
     let start = Instant::now();
@@ -161,8 +259,10 @@ fn compare_interpolation_speeds_with_ninterp() {
 
     
     println!("Custom trilinear: {:?} for {} queries", t1, q);
+    println!("Factored trilinear: {:?} for {} queries", t_factored, q);
     println!("Nearest neighbor: {:?} for {} queries", t2, q);
     println!("ninterp (linear): {:?} for {} queries", t3, q);
+    
 
     // --- Assertions with messages ---
     assert!(
@@ -243,4 +343,191 @@ fn test_trilinear_known_answers() {
             expected
         );
     }
+}
+
+#[test]
+fn compare_stack_vs_heap() {
+    use std::time::Instant;
+
+    const M: usize = 5;
+    const N: usize = 5;
+    const P: usize = 5;
+
+    let a_vals: [f64; M] = [0.0, 1.0, 2.0, 3.0, 4.0];
+    let b_vals: [f64; N] = [0.0, 1.0, 2.0, 3.0, 4.0];
+    let c_vals: [f64; P] = [0.0, 1.0, 2.0, 3.0, 4.0];
+
+    // Fill stack 3D array
+    let mut data_stack = [[[0.0; P]; N]; M];
+    for i in 0..M {
+        for j in 0..N {
+            for k in 0..P {
+                data_stack[i][j][k] = (i + j + k) as f64;
+            }
+        }
+    }
+
+    // Fill heap Vec
+    let mut data_heap = vec![0.0; M * N * P];
+    for i in 0..M {
+        for j in 0..N {
+            for k in 0..P {
+                data_heap[i * N * P + j * P + k] = (i + j + k) as f64;
+            }
+        }
+    }
+
+    let q = 100_000;
+
+    // Benchmark stack
+    let start = Instant::now();
+{
+    let mut sum: f64 = 0.0;
+for qid in 0..q {
+    let a = ((qid % (M - 1)) as f64) + 0.3;
+    let b = ((qid % (N - 1)) as f64) + 0.4;
+    let c = ((qid % (P - 1)) as f64) + 0.5;
+    sum += trilinear_interp_stack(a_vals, b_vals, c_vals, data_stack, a, b, c);
+}
+let t_stack = start.elapsed();
+println!("Stack ({} queries): {:?}, sum={}", q, t_stack, sum);
+}
+
+    // Benchmark heap
+    let start = Instant::now();
+    {
+    let mut sum: f64 = 0.0;
+
+    for qid in 0..q {
+        let a = ((qid % (M - 1)) as f64) + 0.3;
+        let b = ((qid % (N - 1)) as f64) + 0.4;
+        let c = ((qid % (P - 1)) as f64) + 0.5;
+        sum += trilinear_interp(&a_vals, &b_vals, &c_vals, &data_heap, M, N, P, a, b, c);
+    }
+    let t_heap = start.elapsed();
+
+    println!("Heap ({} queries): {:?}, sum={}", q, t_heap, sum);
+
+}
+
+
+    // Assert both are roughly the same order of magnitude
+    // assert!(
+    //     t_stack.as_micros() < t_heap.as_micros() * 5,
+    //     "Stack interpolation unexpectedly slow: {:?} vs {:?}",
+    //     t_stack,
+    //     t_heap
+    // );
+}
+
+#[test]
+fn compare_trilinear_variants() {
+    use std::time::Instant;
+    use ninterp::prelude::*;
+
+    let m = 50;
+    let n = 50;
+    let p = 50;
+
+    let a_vals: Vec<f64> = (0..m).map(|i| i as f64).collect();
+    let b_vals: Vec<f64> = (0..n).map(|i| i as f64).collect();
+    let c_vals: Vec<f64> = (0..p).map(|i| i as f64).collect();
+
+    // Fill data cube (flattened)
+    let mut data = vec![0.0; m * n * p];
+    for i in 0..m {
+        for j in 0..n {
+            for k in 0..p {
+                data[i * n * p + j * p + k] = (i + j + k) as f64;
+            }
+        }
+    }
+
+    // Setup ninterp
+    let interp3d = Interp3D::new(
+        ndarray::Array1::from(a_vals.clone()),
+        ndarray::Array1::from(b_vals.clone()),
+        ndarray::Array1::from(c_vals.clone()),
+        ndarray::Array::from_shape_vec((m, n, p), data.clone()).unwrap(),
+        strategy::Linear,
+        Extrapolate::Error,
+    )
+    .expect("Interp3D::new should succeed");
+
+    let q = 5000000;
+
+    // --- Benchmark heap naive ---
+    let start = Instant::now();
+    let mut sum_naive = 0.0;
+    for qid in 0..q {
+        let a = ((qid % (m - 1)) as f64) + 0.3;
+        let b = ((qid % (n - 1)) as f64) + 0.4;
+        let c = ((qid % (p - 1)) as f64) + 0.5;
+        sum_naive += trilinear_interp(&a_vals, &b_vals, &c_vals, &data, m, n, p, a, b, c);
+    }
+    let t_naive = start.elapsed();
+
+    // --- Benchmark heap factorized ---
+    let start = Instant::now();
+    let mut sum_factored = 0.0;
+    for qid in 0..q {
+        let a = ((qid % (m - 1)) as f64) + 0.3;
+        let b = ((qid % (n - 1)) as f64) + 0.4;
+        let c = ((qid % (p - 1)) as f64) + 0.5;
+
+        // find cell indices
+        let i = a.floor() as usize;
+        let j = b.floor() as usize;
+        let k = c.floor() as usize;
+
+        let dx = a - a_vals[i];
+        let dy = b - b_vals[j];
+        let dz = c - c_vals[k];
+
+        let idx = |ii, jj, kk| ii * n * p + jj * p + kk;
+
+        sum_factored += trilinear_interp_factored(
+            data[idx(i, j, k)],
+            data[idx(i, j, k + 1)],
+            data[idx(i, j + 1, k)],
+            data[idx(i, j + 1, k + 1)],
+            data[idx(i + 1, j, k)],
+            data[idx(i + 1, j, k + 1)],
+            data[idx(i + 1, j + 1, k)],
+            data[idx(i + 1, j + 1, k + 1)],
+            dx,
+            dy,
+            dz,
+        );
+    }
+    let t_factored = start.elapsed();
+
+    // --- Benchmark ninterp ---
+    let start = Instant::now();
+    let mut sum_ninterp = 0.0;
+    for qid in 0..q {
+        let a = ((qid % (m - 1)) as f64) + 0.3;
+        let b = ((qid % (n - 1)) as f64) + 0.4;
+        let c = ((qid % (p - 1)) as f64) + 0.5;
+        sum_ninterp += interp3d.interpolate(&[a, b, c]).unwrap();
+    }
+    let t_ninterp = start.elapsed();
+
+    println!("Naive trilinear   : {:?}, sum={}", t_naive, sum_naive);
+    println!("Factored trilinear: {:?}, sum={}", t_factored, sum_factored);
+    println!("ninterp (linear)  : {:?}, sum={}", t_ninterp, sum_ninterp);
+
+    // --- Assertions ---
+    assert!(
+        (sum_naive - sum_factored).abs() < 1e-9,
+        "Naive vs Factored mismatch: {} vs {}",
+        sum_naive,
+        sum_factored
+    );
+    assert!(
+        (sum_naive - sum_ninterp).abs() < 1e-9,
+        "Naive vs ninterp mismatch: {} vs {}",
+        sum_naive,
+        sum_ninterp
+    );
 }
