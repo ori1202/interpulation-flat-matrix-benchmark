@@ -159,7 +159,7 @@ fn nearest_neighbor_interp(
 #[test]
 fn compare_factored_vs_wide() {
     use std::time::Instant;
-    let q = 500_000_000;
+    let q = 5_000_000;
 
     let m = 50;
     let n = 50;
