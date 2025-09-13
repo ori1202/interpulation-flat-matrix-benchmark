@@ -1,4 +1,59 @@
 use wide::f64x4;
+use csv::ReaderBuilder;
+use serde::Deserialize;
+use std::error::Error;
+
+#[derive(Debug, Deserialize)]
+struct Row {
+    a: f64,
+    b: f64,
+    c: f64,
+    value: f64,
+}
+
+fn load_interp_table(path: &str) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, usize, usize, usize), Box<dyn Error>> {
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(true)
+        .from_path(path)?;
+
+    let mut rows: Vec<Row> = Vec::new();
+    for result in rdr.deserialize() {
+        let row: Row = result?;
+        rows.push(row);
+    }
+
+    // Collect unique axis values
+    let mut a_vals: Vec<f64> = rows.iter().map(|r| r.a).collect();
+    let mut b_vals: Vec<f64> = rows.iter().map(|r| r.b).collect();
+    let mut c_vals: Vec<f64> = rows.iter().map(|r| r.c).collect();
+
+    a_vals.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    b_vals.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    c_vals.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    a_vals.dedup();
+    b_vals.dedup();
+    c_vals.dedup();
+
+    let m = a_vals.len();
+    let n = b_vals.len();
+    let p = c_vals.len();
+
+    // Flatten into Vec<f64> [m × n × p]
+    let mut data = vec![0.0; m * n * p];
+    for r in rows {
+        let i = a_vals.iter().position(|&v| v == r.a).unwrap();
+        let j = b_vals.iter().position(|&v| v == r.b).unwrap();
+        let k = c_vals.iter().position(|&v| v == r.c).unwrap();
+        data[i * n * p + j * p + k] = r.value;
+    }
+
+    Ok((a_vals, b_vals, c_vals, data, m, n, p))
+}
+
+fn setup_from_csv() -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, usize, usize, usize) {
+    load_interp_table("interp_tb.csv").expect("failed to load CSV")
+}
+
 
 fn trilinear_interp(
     a_vals: &[f64],
@@ -159,32 +214,17 @@ fn nearest_neighbor_interp(
 #[test]
 fn compare_factored_vs_wide() {
     use std::time::Instant;
-    let q = 5_000_000;
+    let q = 500_000;
 
-    let m = 50;
-    let n = 50;
-    let p = 50;
-
-    let a_vals: Vec<f64> = (0..m).map(|i| i as f64).collect();
-    let b_vals: Vec<f64> = (0..n).map(|i| i as f64).collect();
-    let c_vals: Vec<f64> = (0..p).map(|i| i as f64).collect();
-
-    let mut data = vec![0.0; m * n * p];
-    for i in 0..m {
-        for j in 0..n {
-            for k in 0..p {
-                data[i * n * p + j * p + k] = (i + j + k) as f64;
-            }
-        }
-    }
+    let (a_vals, b_vals, c_vals, data, m, n, p) = setup_from_csv();
 
     // --- Scalar factored ---
     let start = Instant::now();
     let mut sum_scalar = 0.0;
     for qid in 0..q {
-        let a = ((qid % (m - 1)) as f64) + 0.3;
-        let b = ((qid % (n - 1)) as f64) + 0.4;
-        let c = ((qid % (p - 1)) as f64) + 0.5;
+        let a = a_vals[(qid % (m - 1))] + 0.3;
+        let b = b_vals[(qid % (n - 1))] + 0.4;
+        let c = c_vals[(qid % (p - 1))] + 0.5;
 
         let i = a.floor() as usize;
         let j = b.floor() as usize;
@@ -219,24 +259,20 @@ fn compare_factored_vs_wide() {
         let mut ax = [0.0; 4];
         let mut bx = [0.0; 4];
         let mut cx = [0.0; 4];
-
         for lane in 0..4 {
             let idx = qid + lane;
             if idx >= q { break; }
-            ax[lane] = ((idx % (m - 1)) as f64) + 0.3;
-            bx[lane] = ((idx % (n - 1)) as f64) + 0.4;
-            cx[lane] = ((idx % (p - 1)) as f64) + 0.5;
+            ax[lane] = a_vals[(idx % (m - 1))] + 0.3;
+            bx[lane] = b_vals[(idx % (n - 1))] + 0.4;
+            cx[lane] = c_vals[(idx % (p - 1))] + 0.5;
         }
-
         let a = f64x4::from(ax);
         let b = f64x4::from(bx);
         let c = f64x4::from(cx);
 
-        // floor to nearest grid index
         let i: [usize; 4] = a.to_array().map(|v| v.floor() as usize);
         let j: [usize; 4] = b.to_array().map(|v| v.floor() as usize);
         let k: [usize; 4] = c.to_array().map(|v| v.floor() as usize);
-        
 
         let dx = a - f64x4::from([a_vals[i[0]], a_vals[i[1]], a_vals[i[2]], a_vals[i[3]]]);
         let dy = b - f64x4::from([b_vals[j[0]], b_vals[j[1]], b_vals[j[2]], b_vals[j[3]]]);
@@ -257,8 +293,8 @@ fn compare_factored_vs_wide() {
     }
     let t_wide = start.elapsed();
 
-    println!("Scalar factored: {:?}, sum={},    q:{}", t_scalar, sum_scalar,q);
-    println!("Wide factored  : {:?}, sum={:?},  q:{}", t_wide, sum_wide.reduce_add(),q);
+    println!("Scalar factored: {:?}, per query: {:?}, sum={},    q:{}", t_scalar,t_scalar/q as u32   ,   sum_scalar, q);
+    println!("Wide factored  : {:?}, per query: {:?}, sum={:?},  q:{}", t_wide,t_wide    /q as u32   ,     sum_wide.reduce_add(), q);
 }
 
 
@@ -386,10 +422,10 @@ fn compare_interpolation_speeds_with_ninterp() {
 
 
     
-    println!("Custom trilinear: {:?} for {} queries", t1, q);
-    println!("Factored trilinear: {:?} for {} queries", t_factored, q);
-    println!("Nearest neighbor: {:?} for {} queries", t2, q);
-    println!("ninterp (linear): {:?} for {} queries", t3, q);
+    println!("Custom trilinear: {:?} for {} queries  , per query: {:?}", t1, q,t1/q as u32);
+    println!("Factored trilinear: {:?} for {} queries, per query: {:?}", t_factored, q,t_factored/q as u32);
+    println!("Nearest neighbor: {:?} for {} queries  , per query: {:?}", t2, q,t2/q as u32);
+    println!("ninterp (linear): {:?} for {} queries  , per query: {:?}", t3, q,t3/q as u32);
     
 
     // --- Assertions with messages ---
@@ -477,15 +513,44 @@ fn test_trilinear_known_answers() {
 fn compare_stack_vs_heap() {
     use std::time::Instant;
 
-    const M: usize = 5;
-    const N: usize = 5;
-    const P: usize = 5;
 
-    let a_vals: [f64; M] = [0.0, 1.0, 2.0, 3.0, 4.0];
-    let b_vals: [f64; N] = [0.0, 1.0, 2.0, 3.0, 4.0];
-    let c_vals: [f64; P] = [0.0, 1.0, 2.0, 3.0, 4.0];
+    let (a_vals, b_vals, c_vals, data, m, n, p) = setup_from_csv();
 
-    // Fill stack 3D array
+    let q = 100_000;
+
+    // Benchmark heap version
+    let start = Instant::now();
+    let mut sum_heap = 0.0;
+    for qid in 0..q {
+        let a = a_vals[qid % (m - 1)]+0.3;
+        let b = b_vals[qid % (n - 1)]+0.4;
+        let c = c_vals[qid % (p - 1)]+0.5;
+        sum_heap += trilinear_interp(&a_vals, &b_vals, &c_vals, &data, m, n, p, a, b, c);
+    }
+    let t_heap = start.elapsed();
+ 
+    println!(
+        "Heap ({} queries): {:?}, per query: {:?}, sum={}",
+        q,
+        t_heap,
+        t_heap / q as u32, // per-query
+        sum_heap
+    );
+
+    // ---------------- Stack benchmark ----------------
+    // Use the same size as heap but as const generics
+    const M: usize = 50;
+    const N: usize = 50;
+    const P: usize = 50;
+
+    let mut a_vals: [f64; M] = [0.0; M];
+    let mut b_vals: [f64; N] = [0.0; N];
+    let mut c_vals: [f64; P] = [0.0; P];
+
+    for i in 0..M { a_vals[i] = i as f64; }
+    for j in 0..N { b_vals[j] = j as f64; }
+    for k in 0..P { c_vals[k] = k as f64; }
+
     let mut data_stack = [[[0.0; P]; N]; M];
     for i in 0..M {
         for j in 0..N {
@@ -495,57 +560,31 @@ fn compare_stack_vs_heap() {
         }
     }
 
-    // Fill heap Vec
-    let mut data_heap = vec![0.0; M * N * P];
-    for i in 0..M {
-        for j in 0..N {
-            for k in 0..P {
-                data_heap[i * N * P + j * P + k] = (i + j + k) as f64;
-            }
-        }
-    }
-
-    let q = 100_000;
-
-    // Benchmark stack
     let start = Instant::now();
-{
-    let mut sum: f64 = 0.0;
-for qid in 0..q {
-    let a = ((qid % (M - 1)) as f64) + 0.3;
-    let b = ((qid % (N - 1)) as f64) + 0.4;
-    let c = ((qid % (P - 1)) as f64) + 0.5;
-    sum += trilinear_interp_stack(a_vals, b_vals, c_vals, data_stack, a, b, c);
-}
-let t_stack = start.elapsed();
-println!("Stack ({} queries): {:?}, sum={}", q, t_stack, sum);
-}
-
-    // Benchmark heap
-    let start = Instant::now();
-    {
-    let mut sum: f64 = 0.0;
-
+    let mut sum_stack = 0.0;
     for qid in 0..q {
         let a = ((qid % (M - 1)) as f64) + 0.3;
         let b = ((qid % (N - 1)) as f64) + 0.4;
         let c = ((qid % (P - 1)) as f64) + 0.5;
-        sum += trilinear_interp(&a_vals, &b_vals, &c_vals, &data_heap, M, N, P, a, b, c);
+        sum_stack += trilinear_interp_stack(a_vals, b_vals, c_vals, data_stack, a, b, c);
     }
-    let t_heap = start.elapsed();
+    let t_stack = start.elapsed();
+    let per_stack_ns = t_stack.as_nanos() as f64 / q as f64;
+    println!(
+        "Stack ({} queries): {:?}, per query: {:.2} ns, sum={}",
+        q, t_stack, per_stack_ns, sum_stack
+    );
+// println!("Stack ({} queries): {:?}, per query: {:?} sum={}", q, t_stack,t_stack/q as u32, sum);
 
-    println!("Heap ({} queries): {:?}, sum={}", q, t_heap, sum);
-
-}
 
 
     // Assert both are roughly the same order of magnitude
-    // assert!(
-    //     t_stack.as_micros() < t_heap.as_micros() * 5,
-    //     "Stack interpolation unexpectedly slow: {:?} vs {:?}",
-    //     t_stack,
-    //     t_heap
-    // );
+    assert!(
+        t_stack.as_micros() < t_heap.as_micros() * 5,
+        "Stack interpolation unexpectedly slow: {:?} vs {:?}",
+        t_stack,
+        t_heap
+    );
 }
 
 #[test]
@@ -641,9 +680,9 @@ fn compare_trilinear_variants() {
     }
     let t_ninterp = start.elapsed();
 
-    println!("Naive trilinear   : {:?}, sum={}", t_naive, sum_naive);
-    println!("Factored trilinear: {:?}, sum={}", t_factored, sum_factored);
-    println!("ninterp (linear)  : {:?}, sum={}", t_ninterp, sum_ninterp);
+    println!("Naive trilinear   : {:?},per query: {:?}, sum={}", t_naive,t_naive            /q as u32, sum_naive);
+    println!("Factored trilinear: {:?},per query: {:?}, sum={}", t_factored, t_factored     /q as u32, sum_factored);
+    println!("ninterp (linear)  : {:?},per query: {:?}, sum={}", t_ninterp,t_ninterp        /q as u32, sum_ninterp);
 
     // --- Assertions ---
     assert!(
@@ -659,3 +698,24 @@ fn compare_trilinear_variants() {
         sum_ninterp
     );
 }
+
+// fn generate_interp_csv() {
+//     use std::fs::File;
+//     use std::io::Write;
+
+//     const M: usize = 50;
+//     const N: usize = 50;
+//     const P: usize = 50;
+
+//     let mut file = File::create("interp_tb.csv").expect("failed to create csv");
+//     writeln!(file, "a,b,c,value").unwrap();
+
+//     for i in 0..M {
+//         for j in 0..N {
+//             for k in 0..P {
+//                 let value = (i + j + k) as f64;
+//                 writeln!(file, "{},{},{},{}", i, j, k, value).unwrap();
+//             }
+//         }
+//     }
+// }
