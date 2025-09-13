@@ -1,3 +1,5 @@
+use wide::f64x4;
+
 fn trilinear_interp(
     a_vals: &[f64],
     b_vals: &[f64],
@@ -66,7 +68,28 @@ fn trilinear_interp_factored(
     c0 * (1.0 - dx) + c1 * dx
 }
 
+fn trilinear_interp_factored_wide(
+    c000: f64x4, c001: f64x4,
+    c010: f64x4, c011: f64x4,
+    c100: f64x4, c101: f64x4,
+    c110: f64x4, c111: f64x4,
+    dx: f64x4, dy: f64x4, dz: f64x4,
+) -> f64x4 {
+    let one = f64x4::splat(1.0);
 
+    // interpolate along z
+    let c00 = c000 * (one - dz) + c001 * dz;
+    let c01 = c010 * (one - dz) + c011 * dz;
+    let c10 = c100 * (one - dz) + c101 * dz;
+    let c11 = c110 * (one - dz) + c111 * dz;
+
+    // along y
+    let c0 = c00 * (one - dy) + c01 * dy;
+    let c1 = c10 * (one - dy) + c11 * dy;
+
+    // along x
+    c0 * (one - dx) + c1 * dx
+}
 
 fn trilinear_interp_stack<const M: usize, const N: usize, const P: usize>(
     a_vals: [f64; M],
@@ -131,6 +154,111 @@ fn nearest_neighbor_interp(
         }
     }
     best_val
+}
+
+#[test]
+fn compare_factored_vs_wide() {
+    use std::time::Instant;
+    let q = 500_000_000;
+
+    let m = 50;
+    let n = 50;
+    let p = 50;
+
+    let a_vals: Vec<f64> = (0..m).map(|i| i as f64).collect();
+    let b_vals: Vec<f64> = (0..n).map(|i| i as f64).collect();
+    let c_vals: Vec<f64> = (0..p).map(|i| i as f64).collect();
+
+    let mut data = vec![0.0; m * n * p];
+    for i in 0..m {
+        for j in 0..n {
+            for k in 0..p {
+                data[i * n * p + j * p + k] = (i + j + k) as f64;
+            }
+        }
+    }
+
+    // --- Scalar factored ---
+    let start = Instant::now();
+    let mut sum_scalar = 0.0;
+    for qid in 0..q {
+        let a = ((qid % (m - 1)) as f64) + 0.3;
+        let b = ((qid % (n - 1)) as f64) + 0.4;
+        let c = ((qid % (p - 1)) as f64) + 0.5;
+
+        let i = a.floor() as usize;
+        let j = b.floor() as usize;
+        let k = c.floor() as usize;
+
+        let dx = a - a_vals[i];
+        let dy = b - b_vals[j];
+        let dz = c - c_vals[k];
+
+        let idx = |ii, jj, kk| ii * n * p + jj * p + kk;
+
+        sum_scalar += trilinear_interp_factored(
+            data[idx(i, j, k)],
+            data[idx(i, j, k + 1)],
+            data[idx(i, j + 1, k)],
+            data[idx(i, j + 1, k + 1)],
+            data[idx(i + 1, j, k)],
+            data[idx(i + 1, j, k + 1)],
+            data[idx(i + 1, j + 1, k)],
+            data[idx(i + 1, j + 1, k + 1)],
+            dx,
+            dy,
+            dz,
+        );
+    }
+    let t_scalar = start.elapsed();
+
+    // --- Wide factored ---
+    let start = Instant::now();
+    let mut sum_wide = f64x4::splat(0.0);
+    for qid in (0..q).step_by(4) {
+        let mut ax = [0.0; 4];
+        let mut bx = [0.0; 4];
+        let mut cx = [0.0; 4];
+
+        for lane in 0..4 {
+            let idx = qid + lane;
+            if idx >= q { break; }
+            ax[lane] = ((idx % (m - 1)) as f64) + 0.3;
+            bx[lane] = ((idx % (n - 1)) as f64) + 0.4;
+            cx[lane] = ((idx % (p - 1)) as f64) + 0.5;
+        }
+
+        let a = f64x4::from(ax);
+        let b = f64x4::from(bx);
+        let c = f64x4::from(cx);
+
+        // floor to nearest grid index
+        let i: [usize; 4] = a.to_array().map(|v| v.floor() as usize);
+        let j: [usize; 4] = b.to_array().map(|v| v.floor() as usize);
+        let k: [usize; 4] = c.to_array().map(|v| v.floor() as usize);
+        
+
+        let dx = a - f64x4::from([a_vals[i[0]], a_vals[i[1]], a_vals[i[2]], a_vals[i[3]]]);
+        let dy = b - f64x4::from([b_vals[j[0]], b_vals[j[1]], b_vals[j[2]], b_vals[j[3]]]);
+        let dz = c - f64x4::from([c_vals[k[0]], c_vals[k[1]], c_vals[k[2]], c_vals[k[3]]]);
+
+        let idx = |ii, jj, kk| ii * n * p + jj * p + kk;
+
+        let c000 = f64x4::from([data[idx(i[0], j[0], k[0])], data[idx(i[1], j[1], k[1])], data[idx(i[2], j[2], k[2])], data[idx(i[3], j[3], k[3])]]);
+        let c001 = f64x4::from([data[idx(i[0], j[0], k[0] + 1)], data[idx(i[1], j[1], k[1] + 1)], data[idx(i[2], j[2], k[2] + 1)], data[idx(i[3], j[3], k[3] + 1)]]);
+        let c010 = f64x4::from([data[idx(i[0], j[0] + 1, k[0])], data[idx(i[1], j[1] + 1, k[1])], data[idx(i[2], j[2] + 1, k[2])], data[idx(i[3], j[3] + 1, k[3])]]);
+        let c011 = f64x4::from([data[idx(i[0], j[0] + 1, k[0] + 1)], data[idx(i[1], j[1] + 1, k[1] + 1)], data[idx(i[2], j[2] + 1, k[2] + 1)], data[idx(i[3], j[3] + 1, k[3] + 1)]]);
+        let c100 = f64x4::from([data[idx(i[0] + 1, j[0], k[0])], data[idx(i[1] + 1, j[1], k[1])], data[idx(i[2] + 1, j[2], k[2])], data[idx(i[3] + 1, j[3], k[3])]]);
+        let c101 = f64x4::from([data[idx(i[0] + 1, j[0], k[0] + 1)], data[idx(i[1] + 1, j[1], k[1] + 1)], data[idx(i[2] + 1, j[2], k[2] + 1)], data[idx(i[3] + 1, j[3], k[3] + 1)]]);
+        let c110 = f64x4::from([data[idx(i[0] + 1, j[0] + 1, k[0])], data[idx(i[1] + 1, j[1] + 1, k[1])], data[idx(i[2] + 1, j[2] + 1, k[2])], data[idx(i[3] + 1, j[3] + 1, k[3])]]);
+        let c111 = f64x4::from([data[idx(i[0] + 1, j[0] + 1, k[0] + 1)], data[idx(i[1] + 1, j[1] + 1, k[1] + 1)], data[idx(i[2] + 1, j[2] + 1, k[2] + 1)], data[idx(i[3] + 1, j[3] + 1, k[3] + 1)]]);
+
+        sum_wide += trilinear_interp_factored_wide(c000, c001, c010, c011, c100, c101, c110, c111, dx, dy, dz);
+    }
+    let t_wide = start.elapsed();
+
+    println!("Scalar factored: {:?}, sum={},    q:{}", t_scalar, sum_scalar,q);
+    println!("Wide factored  : {:?}, sum={:?},  q:{}", t_wide, sum_wide.reduce_add(),q);
 }
 
 
