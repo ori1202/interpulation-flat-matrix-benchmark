@@ -291,55 +291,6 @@ fn bracket(axis: &[f64], x: f64) -> (usize, usize, f64) {
 /// Hexalinear (6-D) interpolation over a regular grid stored in a flat Vec<f64>.
 /// Axes must be sorted ascending. `dims = [d0,d1,d2,d3,d4,d5]` and
 /// `data.len() == d0*d1*d2*d3*d4*d5`. `x = [x0..x5]` is the query.
-fn hexalinear_interp(axes: [&[f64]; 6], data: &[f64], dims: [usize; 6], x: [f64; 6]) -> f64 {
-    // bracketing + weights
-    let (i0a, i1a, ta) = bracket(axes[0], x[0]);
-    let (i0b, i1b, tb) = bracket(axes[1], x[1]);
-    let (i0c, i1c, tc) = bracket(axes[2], x[2]);
-    let (i0d, i1d, td) = bracket(axes[3], x[3]);
-    let (i0e, i1e, te) = bracket(axes[4], x[4]);
-    let (i0f, i1f, tf) = bracket(axes[5], x[5]);
-
-    // strides for row-major [a,b,c,d,e,f]
-    let [d0, d1, d2, d3, d4, d5] = dims;
-    assert_eq!(data.len(), d0 * d1 * d2 * d3 * d4 * d5, "data size mismatch");
-    let s5 = 1usize;
-    let s4 = d5 * s5;
-    let s3 = d4 * s4;
-    let s2 = d3 * s3;
-    let s1 = d2 * s2;
-    let s0 = d1 * s1;
-
-    // 1) reduce along F for all 32 combos of A..E (bit order: E,D,C,B,A as 0..4)
-    let mut v32 = [0.0f64; 32];
-    for code in 0..32 {
-        let ia = if (code >> 4) & 1 == 0 { i0a } else { i1a };
-        let ib = if (code >> 3) & 1 == 0 { i0b } else { i1b };
-        let ic = if (code >> 2) & 1 == 0 { i0c } else { i1c };
-        let id = if (code >> 1) & 1 == 0 { i0d } else { i1d };
-        let ie = if (code >> 0) & 1 == 0 { i0e } else { i1e };
-        let base = ia * s0 + ib * s1 + ic * s2 + id * s3 + ie * s4;
-        let v0 = data[base + i0f * s5];
-        let v1 = data[base + i1f * s5];
-        v32[code] = v0 + (v1 - v0) * tf;
-    }
-
-    // 2) successive linear reductions: along E, D, C, B, then A
-    let mut v16 = [0.0f64; 16];
-    for i in 0..16 { v16[i] = v32[2 * i] + (v32[2 * i + 1] - v32[2 * i]) * te; }
-
-    let mut v8 = [0.0f64; 8];
-    for i in 0..8 { v8[i] = v16[2 * i] + (v16[2 * i + 1] - v16[2 * i]) * td; }
-
-    let mut v4 = [0.0f64; 4];
-    for i in 0..4 { v4[i] = v8[2 * i] + (v8[2 * i + 1] - v8[2 * i]) * tc; }
-
-    let mut v2 = [0.0f64; 2];
-    for i in 0..2 { v2[i] = v4[2 * i] + (v4[2 * i + 1] - v4[2 * i]) * tb; }
-
-    v2[0] + (v2[1] - v2[0]) * ta
-}
-
 fn hexalinear_interp_fast(
     axes: [&[f64]; 6],
     data: &[f64],
@@ -354,7 +305,7 @@ fn hexalinear_interp_fast(
     let (i0e, i1e, te) = bracket(axes[4], x[4]);
     let (i0f, i1f, tf) = bracket(axes[5], x[5]);
 
-    let [d0, d1, d2, d3, d4, d5] = dims;
+    let [_d0, d1, d2, d3, d4, d5] = dims;
     let s5 = 1;
     let s4 = d5 * s5;
     let s3 = d4 * s4;
@@ -404,6 +355,117 @@ fn hexalinear_interp_fast(
     f2[0] + (f2[1] - f2[0]) * ta
 }
 
+#[test]
+fn hexalinear_known_linear_function_is_exact() {
+        // axes: 0,1,2 on each dimension
+        let ax = vec![0.0, 1.0, 2.0];
+        let bx = vec![0.0, 1.0, 2.0];
+        let cx = vec![0.0, 1.0, 2.0];
+        let dx = vec![0.0, 1.0, 2.0];
+        let ex = vec![0.0, 1.0, 2.0];
+        let fx = vec![0.0, 1.0, 2.0];
+        let axes = [&ax[..], &bx[..], &cx[..], &dx[..], &ex[..], &fx[..]];
+        let dims = [3, 3, 3, 3, 3, 3];
+
+        // fill data[i,j,k,l,m,n] = a_i + b_j + c_k + d_l + e_m + f_n
+        let [d0, d1, d2, d3, d4, d5] = dims;
+        let s5 = 1usize;
+        let s4 = d5 * s5;
+        let s3 = d4 * s4;
+        let s2 = d3 * s3;
+        let s1 = d2 * s2;
+        let s0 = d1 * s1;
+        let mut data = vec![0.0; d0 * d1 * d2 * d3 * d4 * d5];
+        for i in 0..d0 {
+            for j in 0..d1 {
+                for k in 0..d2 {
+                    for l in 0..d3 {
+                        for m in 0..d4 {
+                            for n in 0..d5 {
+                                let idx = i * s0 + j * s1 + k * s2 + l * s3 + m * s4 + n * s5;
+                                data[idx] = ax[i] + bx[j] + cx[k] + dx[l] + ex[m] + fx[n];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+       
+
+        // a few exact tests (grid points + midpoints)
+        let cases = [
+            ([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 0.0),
+            ([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 6.0),
+            ([2.0, 2.0, 2.0, 2.0, 1.0, 2.0], 11.0),
+            ([0.5, 0.5, 0.5, 0.5, 0.5, 0.5], 3.0),
+            ([1.2, 0.3, 1.5, 0.1, 1.8, 0.4], 1.2 + 0.3 + 1.5 + 0.1 + 1.8 + 0.4),
+        ];
+
+        for (pt, expect) in cases {
+            let v = hexalinear_interp_fast(axes, &data, dims, pt);
+            assert!(
+                (v - expect).abs() < 1e-12,
+                "hexalinear mismatch at {:?}: got {}, expected {}",
+                pt,
+                v,
+                expect
+            );
+        }
+    }
+
+
+/// Hexalinear (6-D) interpolation over a regular grid stored in a flat Vec<f64>.
+/// Axes must be sorted ascending. `dims = [d0,d1,d2,d3,d4,d5]` and
+/// `data.len() == d0*d1*d2*d3*d4*d5`. `x = [x0..x5]` is the query.
+fn _hexalinear_interp(axes: [&[f64]; 6], data: &[f64], dims: [usize; 6], x: [f64; 6]) -> f64 {
+    // bracketing + weights
+    let (i0a, i1a, ta) = bracket(axes[0], x[0]);
+    let (i0b, i1b, tb) = bracket(axes[1], x[1]);
+    let (i0c, i1c, tc) = bracket(axes[2], x[2]);
+    let (i0d, i1d, td) = bracket(axes[3], x[3]);
+    let (i0e, i1e, te) = bracket(axes[4], x[4]);
+    let (i0f, i1f, tf) = bracket(axes[5], x[5]);
+
+    // strides for row-major [a,b,c,d,e,f]
+    let [d0, d1, d2, d3, d4, d5] = dims;
+    assert_eq!(data.len(), d0 * d1 * d2 * d3 * d4 * d5, "data size mismatch");
+    let s5 = 1usize;
+    let s4 = d5 * s5;
+    let s3 = d4 * s4;
+    let s2 = d3 * s3;
+    let s1 = d2 * s2;
+    let s0 = d1 * s1;
+
+    // 1) reduce along F for all 32 combos of A..E (bit order: E,D,C,B,A as 0..4)
+    let mut v32 = [0.0f64; 32];
+    for code in 0..32 {
+        let ia = if (code >> 4) & 1 == 0 { i0a } else { i1a };
+        let ib = if (code >> 3) & 1 == 0 { i0b } else { i1b };
+        let ic = if (code >> 2) & 1 == 0 { i0c } else { i1c };
+        let id = if (code >> 1) & 1 == 0 { i0d } else { i1d };
+        let ie = if (code >> 0) & 1 == 0 { i0e } else { i1e };
+        let base = ia * s0 + ib * s1 + ic * s2 + id * s3 + ie * s4;
+        let v0 = data[base + i0f * s5];
+        let v1 = data[base + i1f * s5];
+        v32[code] = v0 + (v1 - v0) * tf;
+    }
+
+    // 2) successive linear reductions: along E, D, C, B, then A
+    let mut v16 = [0.0f64; 16];
+    for i in 0..16 { v16[i] = v32[2 * i] + (v32[2 * i + 1] - v32[2 * i]) * te; }
+
+    let mut v8 = [0.0f64; 8];
+    for i in 0..8 { v8[i] = v16[2 * i] + (v16[2 * i + 1] - v16[2 * i]) * td; }
+
+    let mut v4 = [0.0f64; 4];
+    for i in 0..4 { v4[i] = v8[2 * i] + (v8[2 * i + 1] - v8[2 * i]) * tc; }
+
+    let mut v2 = [0.0f64; 2];
+    for i in 0..2 { v2[i] = v4[2 * i] + (v4[2 * i + 1] - v4[2 * i]) * tb; }
+
+    v2[0] + (v2[1] - v2[0]) * ta
+}
+
 
 fn idx6(n:usize,o:usize,p:usize,q:usize,r:usize,
     ia:usize,jb:usize,kc:usize,ld:usize,me:usize,nf:usize) -> usize {
@@ -449,7 +511,7 @@ fn compare_hexalinear_speeds() {
     let dims = [m, n, o, p, q, r];
 
     // Deterministic queries
-    let nq_total = 20_000_000; // reduce if needed
+    let nq_total = 10_000*50; // reduce if needed
     let queries: Vec<[f64; 6]> = (0..nq_total)
         .map(|k| {
             let t = (k as f64) / (nq_total as f64) * ((npts - 1) as f64);
@@ -521,63 +583,6 @@ fn compare_hexalinear_speeds() {
 
 
 
-#[test]
-fn hexalinear_known_linear_function_is_exact() {
-        // axes: 0,1,2 on each dimension
-        let ax = vec![0.0, 1.0, 2.0];
-        let bx = vec![0.0, 1.0, 2.0];
-        let cx = vec![0.0, 1.0, 2.0];
-        let dx = vec![0.0, 1.0, 2.0];
-        let ex = vec![0.0, 1.0, 2.0];
-        let fx = vec![0.0, 1.0, 2.0];
-        let axes = [&ax[..], &bx[..], &cx[..], &dx[..], &ex[..], &fx[..]];
-        let dims = [3, 3, 3, 3, 3, 3];
-
-        // fill data[i,j,k,l,m,n] = a_i + b_j + c_k + d_l + e_m + f_n
-        let [d0, d1, d2, d3, d4, d5] = dims;
-        let s5 = 1usize;
-        let s4 = d5 * s5;
-        let s3 = d4 * s4;
-        let s2 = d3 * s3;
-        let s1 = d2 * s2;
-        let s0 = d1 * s1;
-        let mut data = vec![0.0; d0 * d1 * d2 * d3 * d4 * d5];
-        for i in 0..d0 {
-            for j in 0..d1 {
-                for k in 0..d2 {
-                    for l in 0..d3 {
-                        for m in 0..d4 {
-                            for n in 0..d5 {
-                                let idx = i * s0 + j * s1 + k * s2 + l * s3 + m * s4 + n * s5;
-                                data[idx] = ax[i] + bx[j] + cx[k] + dx[l] + ex[m] + fx[n];
-                            }
-                        }
-                    }
-                }
-            }
-        }
-       
-
-        // a few exact tests (grid points + midpoints)
-        let cases = [
-            ([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 0.0),
-            ([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 6.0),
-            ([2.0, 2.0, 2.0, 2.0, 1.0, 2.0], 11.0),
-            ([0.5, 0.5, 0.5, 0.5, 0.5, 0.5], 3.0),
-            ([1.2, 0.3, 1.5, 0.1, 1.8, 0.4], 1.2 + 0.3 + 1.5 + 0.1 + 1.8 + 0.4),
-        ];
-
-        for (pt, expect) in cases {
-            let v = hexalinear_interp_fast(axes, &data, dims, pt);
-            assert!(
-                (v - expect).abs() < 1e-12,
-                "hexalinear mismatch at {:?}: got {}, expected {}",
-                pt,
-                v,
-                expect
-            );
-        }
-    }
 
 #[test]
 fn test_hexalinear_known_function() {
