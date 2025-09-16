@@ -10,3 +10,4 @@ ndarray = "0.16.1"
 ninterp = "0.7.3"
 serde = { version = "1.0.219", features = ["derive"] }
 wide = "0.7.33"
+rand = { version = "0.8", features = ["small_rng"] }

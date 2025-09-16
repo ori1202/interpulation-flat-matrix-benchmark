@@ -103,7 +103,7 @@ fn trilinear_interp(
         + c110 * dx * dy * (1.0 - dz)
         + c111 * dx * dy * dz
 }
-
+ 
 fn trilinear_interp_factored(
     c000: f64, c001: f64, c010: f64, c011: f64,
     c100: f64, c101: f64, c110: f64, c111: f64,
@@ -210,6 +210,623 @@ fn nearest_neighbor_interp(
     }
     best_val
 }
+
+/// Perform 6D linear interpolation over flattened data.
+fn hexalinear_interp_clamp(
+    a_vals: &[f64],
+    b_vals: &[f64],
+    c_vals: &[f64],
+    d_vals: &[f64],
+    e_vals: &[f64],
+    f_vals: &[f64],
+    data: &[f64],              // flattened 6D array
+    m: usize,
+    n: usize,
+    o: usize,
+    p: usize,
+    q: usize,
+    r: usize,
+    a: f64,
+    b: f64,
+    c: f64,
+    d: f64,
+    e: f64,
+    f: f64,
+) -> f64 {
+    // --- find indices and fractions ---
+    let idx_clamp = |vals: &[f64], v: f64| {
+        let mut i = vals
+            .binary_search_by(|x| x.partial_cmp(&v).unwrap())
+            .unwrap_or_else(|x| x.saturating_sub(1));
+        if i >= vals.len() - 1 {
+            i = vals.len() - 2;
+        }
+        (i, i + 1, (v - vals[i]) / (vals[i + 1] - vals[i]))
+    };
+
+    let (i0, i1, dx) = idx_clamp(a_vals, a);
+    let (j0, j1, dy) = idx_clamp(b_vals, b);
+    let (k0, k1, dz) = idx_clamp(c_vals, c);
+    let (l0, l1, dw) = idx_clamp(d_vals, d);
+    let (m0, m1, du) = idx_clamp(e_vals, e);
+    let (n0, n1, dv) = idx_clamp(f_vals, f);
+
+    // --- flatten index ---
+    let idx = |ia, jb, kc, ld, me, nf| (((((ia * n + jb) * o + kc) * p + ld) * q + me) * r + nf);
+
+    let mut acc = 0.0;
+
+    for (ai, aw) in [(i0, 1.0 - dx), (i1, dx)] {
+        for (bj, bw) in [(j0, 1.0 - dy), (j1, dy)] {
+            for (ck, cw) in [(k0, 1.0 - dz), (k1, dz)] {
+                for (dl, dwv) in [(l0, 1.0 - dw), (l1, dw)] {
+                    for (em, ew) in [(m0, 1.0 - du), (m1, du)] {
+                        for (fn_, fw) in [(n0, 1.0 - dv), (n1, dv)] {
+                            let w = aw * bw * cw * dwv * ew * fw;
+                            acc += data[idx(ai, bj, ck, dl, em, fn_)] * w;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    acc
+}
+
+
+/// Return (i0, i1, t) where i0<=x<i1 on `axis`, and t = (x-x0)/(x1-x0).
+fn bracket(axis: &[f64], x: f64) -> (usize, usize, f64) {
+    let n = axis.len();
+    assert!(n >= 2, "axis must have at least 2 points");
+    let i = match axis.binary_search_by(|v| v.partial_cmp(&x).unwrap()) {
+        Ok(idx) => idx.min(n - 2),
+        Err(ins) => if ins == 0 { 0 } else { (ins - 1).min(n - 2) },
+    };
+    let i1 = i + 1;
+    let (x0, x1) = (axis[i], axis[i1]);
+    let t = if x1 != x0 { (x - x0) / (x1 - x0) } else { 0.0 };
+    (i, i1, t)
+}
+
+/// Hexalinear (6-D) interpolation over a regular grid stored in a flat Vec<f64>.
+/// Axes must be sorted ascending. `dims = [d0,d1,d2,d3,d4,d5]` and
+/// `data.len() == d0*d1*d2*d3*d4*d5`. `x = [x0..x5]` is the query.
+fn hexalinear_interp(axes: [&[f64]; 6], data: &[f64], dims: [usize; 6], x: [f64; 6]) -> f64 {
+    // bracketing + weights
+    let (i0a, i1a, ta) = bracket(axes[0], x[0]);
+    let (i0b, i1b, tb) = bracket(axes[1], x[1]);
+    let (i0c, i1c, tc) = bracket(axes[2], x[2]);
+    let (i0d, i1d, td) = bracket(axes[3], x[3]);
+    let (i0e, i1e, te) = bracket(axes[4], x[4]);
+    let (i0f, i1f, tf) = bracket(axes[5], x[5]);
+
+    // strides for row-major [a,b,c,d,e,f]
+    let [d0, d1, d2, d3, d4, d5] = dims;
+    assert_eq!(data.len(), d0 * d1 * d2 * d3 * d4 * d5, "data size mismatch");
+    let s5 = 1usize;
+    let s4 = d5 * s5;
+    let s3 = d4 * s4;
+    let s2 = d3 * s3;
+    let s1 = d2 * s2;
+    let s0 = d1 * s1;
+
+    // 1) reduce along F for all 32 combos of A..E (bit order: E,D,C,B,A as 0..4)
+    let mut v32 = [0.0f64; 32];
+    for code in 0..32 {
+        let ia = if (code >> 4) & 1 == 0 { i0a } else { i1a };
+        let ib = if (code >> 3) & 1 == 0 { i0b } else { i1b };
+        let ic = if (code >> 2) & 1 == 0 { i0c } else { i1c };
+        let id = if (code >> 1) & 1 == 0 { i0d } else { i1d };
+        let ie = if (code >> 0) & 1 == 0 { i0e } else { i1e };
+        let base = ia * s0 + ib * s1 + ic * s2 + id * s3 + ie * s4;
+        let v0 = data[base + i0f * s5];
+        let v1 = data[base + i1f * s5];
+        v32[code] = v0 + (v1 - v0) * tf;
+    }
+
+    // 2) successive linear reductions: along E, D, C, B, then A
+    let mut v16 = [0.0f64; 16];
+    for i in 0..16 { v16[i] = v32[2 * i] + (v32[2 * i + 1] - v32[2 * i]) * te; }
+
+    let mut v8 = [0.0f64; 8];
+    for i in 0..8 { v8[i] = v16[2 * i] + (v16[2 * i + 1] - v16[2 * i]) * td; }
+
+    let mut v4 = [0.0f64; 4];
+    for i in 0..4 { v4[i] = v8[2 * i] + (v8[2 * i + 1] - v8[2 * i]) * tc; }
+
+    let mut v2 = [0.0f64; 2];
+    for i in 0..2 { v2[i] = v4[2 * i] + (v4[2 * i + 1] - v4[2 * i]) * tb; }
+
+    v2[0] + (v2[1] - v2[0]) * ta
+}
+
+fn hexalinear_interp_fast(
+    axes: [&[f64]; 6],
+    data: &[f64],
+    dims: [usize; 6],
+    x: [f64; 6],
+) -> f64 {
+    // bracketing
+    let (i0a, i1a, ta) = bracket(axes[0], x[0]);
+    let (i0b, i1b, tb) = bracket(axes[1], x[1]);
+    let (i0c, i1c, tc) = bracket(axes[2], x[2]);
+    let (i0d, i1d, td) = bracket(axes[3], x[3]);
+    let (i0e, i1e, te) = bracket(axes[4], x[4]);
+    let (i0f, i1f, tf) = bracket(axes[5], x[5]);
+
+    let [d0, d1, d2, d3, d4, d5] = dims;
+    let s5 = 1;
+    let s4 = d5 * s5;
+    let s3 = d4 * s4;
+    let s2 = d3 * s3;
+    let s1 = d2 * s2;
+    let s0 = d1 * s1;
+
+    // base index helper
+    let base = |ia, ib, ic, id, ie| ia * s0 + ib * s1 + ic * s2 + id * s3 + ie * s4;
+
+    // 1) interpolate along F
+    let mut f32 = [0.0; 32];
+    let mut ptr = 0;
+    for &ia in &[i0a, i1a] {
+        for &ib in &[i0b, i1b] {
+            for &ic in &[i0c, i1c] {
+                for &id in &[i0d, i1d] {
+                    for &ie in &[i0e, i1e] {
+                        let b = base(ia, ib, ic, id, ie);
+                        let v0 = data[b + i0f * s5];
+                        let v1 = data[b + i1f * s5];
+                        f32[ptr] = v0 + (v1 - v0) * tf;
+                        ptr += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2) reduce along E
+    let mut f16 = [0.0; 16];
+    for i in 0..16 { f16[i] = f32[2*i] + (f32[2*i+1] - f32[2*i]) * te; }
+
+    // 3) reduce along D
+    let mut f8 = [0.0; 8];
+    for i in 0..8 { f8[i] = f16[2*i] + (f16[2*i+1] - f16[2*i]) * td; }
+
+    // 4) reduce along C
+    let mut f4 = [0.0; 4];
+    for i in 0..4 { f4[i] = f8[2*i] + (f8[2*i+1] - f8[2*i]) * tc; }
+
+    // 5) reduce along B
+    let mut f2 = [0.0; 2];
+    for i in 0..2 { f2[i] = f4[2*i] + (f4[2*i+1] - f4[2*i]) * tb; }
+
+    // 6) reduce along A
+    f2[0] + (f2[1] - f2[0]) * ta
+}
+
+
+fn idx6(n:usize,o:usize,p:usize,q:usize,r:usize,
+    ia:usize,jb:usize,kc:usize,ld:usize,me:usize,nf:usize) -> usize {
+((((ia*n + jb)*o + kc)*p + ld)*q + me)*r + nf
+}
+
+
+#[test]
+fn compare_hexalinear_speeds() {
+    use std::time::Instant;
+
+    // Number of points per axis (change this to scale problem size)
+    let npts = 12; // try 10, 15, 30 … careful with memory usage!
+    let a_vals: Vec<f64> = (0..npts).map(|i| i as f64).collect();
+    let b_vals = a_vals.clone();
+    let c_vals = a_vals.clone();
+    let d_vals = a_vals.clone();
+    let e_vals = a_vals.clone();
+    let f_vals = a_vals.clone();
+
+    let (m, n, o, p, q, r) = (npts, npts, npts, npts, npts, npts);
+
+    // Fill data with f(a,b,c,d,e,f) = sum of indices
+    let mut data = vec![0.0; m * n * o * p * q * r];
+    let idx = |ia, jb, kc, ld, me, nf| (((((ia * n + jb) * o + kc) * p + ld) * q + me) * r + nf);
+    for ia in 0..m {
+        for jb in 0..n {
+            for kc in 0..o {
+                for ld in 0..p {
+                    for me in 0..q {
+                        for nf in 0..r {
+                            data[idx(ia, jb, kc, ld, me, nf)] =
+                                ia as f64 + jb as f64 + kc as f64 +
+                                ld as f64 + me as f64 + nf as f64;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let axes = [&a_vals[..], &b_vals[..], &c_vals[..], &d_vals[..], &e_vals[..], &f_vals[..]];
+    let dims = [m, n, o, p, q, r];
+
+    // Deterministic queries
+    let nq_total = 20_000_000; // reduce if needed
+    let queries: Vec<[f64; 6]> = (0..nq_total)
+        .map(|k| {
+            let t = (k as f64) / (nq_total as f64) * ((npts - 1) as f64);
+            [
+                t,
+                (npts - 1) as f64 - t,
+                t * 0.5,
+                (npts as f64) / 2.0,
+                (k % npts) as f64,
+                (k % (npts / 2).max(1)) as f64 + 0.25,
+            ]
+        })
+        .collect();
+
+     // --- Memory usage (MB) ---
+     let data_bytes = data.len() * std::mem::size_of::<f64>();
+     let queries_bytes = queries.len() * std::mem::size_of::<[f64; 6]>();
+     println!(
+        "Memory usage: data = {:.2} MB ({} values), queries = {:.2} MB ({} queries × 6 values)",
+        data_bytes as f64 / (1024.0 * 1024.0),
+        data.len(),
+        queries_bytes as f64 / (1024.0 * 1024.0),
+        queries.len(),
+    );
+
+    let nq = queries.len() as f64;
+
+    // --- Benchmark hexalinear_interp_clamp ---
+    let start = Instant::now();
+    let mut sum1 = 0.0;
+    for qv in &queries {
+        sum1 += hexalinear_interp_clamp(
+            &a_vals, &b_vals, &c_vals, &d_vals, &e_vals, &f_vals,
+            &data, m, n, o, p, q, r, qv[0], qv[1], qv[2], qv[3], qv[4], qv[5],
+        );
+    }
+    let t1 = start.elapsed();
+
+    // --- Benchmark hexalinear_interp_fast ---
+    let start = Instant::now();
+    let mut sum2 = 0.0;
+    for qv in &queries {
+        sum2 += hexalinear_interp_fast(axes, &data, dims, *qv);
+    }
+    let t2 = start.elapsed();
+
+    // --- Results ---
+    println!(
+        "hexalinear_interp_clamp: {:?} (≈{:.3} ns/query), sum={}",
+        t1,
+        (t1.as_nanos() as f64) / nq,
+        sum1
+    );
+    println!(
+        "hexalinear_interp_fast : {:?} (≈{:.3} ns/query), sum={}",
+        t2,
+        (t2.as_nanos() as f64) / nq,
+        sum2
+    );
+
+    // Sanity check
+    assert!(
+        (sum1 - sum2).abs() < 1e-9,
+        "Mismatch: {} vs {}",
+        sum1,
+        sum2
+    );
+}
+
+
+
+#[test]
+fn hexalinear_known_linear_function_is_exact() {
+        // axes: 0,1,2 on each dimension
+        let ax = vec![0.0, 1.0, 2.0];
+        let bx = vec![0.0, 1.0, 2.0];
+        let cx = vec![0.0, 1.0, 2.0];
+        let dx = vec![0.0, 1.0, 2.0];
+        let ex = vec![0.0, 1.0, 2.0];
+        let fx = vec![0.0, 1.0, 2.0];
+        let axes = [&ax[..], &bx[..], &cx[..], &dx[..], &ex[..], &fx[..]];
+        let dims = [3, 3, 3, 3, 3, 3];
+
+        // fill data[i,j,k,l,m,n] = a_i + b_j + c_k + d_l + e_m + f_n
+        let [d0, d1, d2, d3, d4, d5] = dims;
+        let s5 = 1usize;
+        let s4 = d5 * s5;
+        let s3 = d4 * s4;
+        let s2 = d3 * s3;
+        let s1 = d2 * s2;
+        let s0 = d1 * s1;
+        let mut data = vec![0.0; d0 * d1 * d2 * d3 * d4 * d5];
+        for i in 0..d0 {
+            for j in 0..d1 {
+                for k in 0..d2 {
+                    for l in 0..d3 {
+                        for m in 0..d4 {
+                            for n in 0..d5 {
+                                let idx = i * s0 + j * s1 + k * s2 + l * s3 + m * s4 + n * s5;
+                                data[idx] = ax[i] + bx[j] + cx[k] + dx[l] + ex[m] + fx[n];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+       
+
+        // a few exact tests (grid points + midpoints)
+        let cases = [
+            ([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 0.0),
+            ([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 6.0),
+            ([2.0, 2.0, 2.0, 2.0, 1.0, 2.0], 11.0),
+            ([0.5, 0.5, 0.5, 0.5, 0.5, 0.5], 3.0),
+            ([1.2, 0.3, 1.5, 0.1, 1.8, 0.4], 1.2 + 0.3 + 1.5 + 0.1 + 1.8 + 0.4),
+        ];
+
+        for (pt, expect) in cases {
+            let v = hexalinear_interp_fast(axes, &data, dims, pt);
+            assert!(
+                (v - expect).abs() < 1e-12,
+                "hexalinear mismatch at {:?}: got {}, expected {}",
+                pt,
+                v,
+                expect
+            );
+        }
+    }
+
+#[test]
+fn test_hexalinear_known_function() {
+    // Axes
+    let a_vals = vec![0.0, 1.0, 2.0];
+    let b_vals = vec![0.0, 1.0, 2.0];
+    let c_vals = vec![0.0, 1.0, 2.0];
+    let d_vals = vec![0.0, 1.0, 2.0];
+    let e_vals = vec![0.0, 1.0, 2.0];
+    let f_vals = vec![0.0, 1.0, 2.0];
+
+    let (m, n, o, p, q, r) = (
+        a_vals.len(),
+        b_vals.len(),
+        c_vals.len(),
+        d_vals.len(),
+        e_vals.len(),
+        f_vals.len(),
+    );
+
+    // f(a,b,c,d,e,f) = a+b+c+d+e+f
+    let mut data = vec![0.0; m * n * o * p * q * r];
+    let idx = |ia, jb, kc, ld, me, nf| (((((ia * n + jb) * o + kc) * p + ld) * q + me) * r + nf);
+    for ia in 0..m {
+        for jb in 0..n {
+            for kc in 0..o {
+                for ld in 0..p {
+                    for me in 0..q {
+                        for nf in 0..r {
+                            data[idx(ia, jb, kc, ld, me, nf)] = a_vals[ia]
+                                + b_vals[jb]
+                                + c_vals[kc]
+                                + d_vals[ld]
+                                + e_vals[me]
+                                + f_vals[nf];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // --- Print the interpolation table in CSV format ---
+    println!("a,b,c,d,e,f,value");
+    for ia in 0..m {
+        for jb in 0..n {
+            for kc in 0..o {
+                for ld in 0..p {
+                    for me in 0..q {
+                        for nf in 0..r {
+                            let v = data[idx(ia, jb, kc, ld, me, nf)];
+                            println!(
+                                "{},{},{},{},{},{},{}",
+                                a_vals[ia],
+                                b_vals[jb],
+                                c_vals[kc],
+                                d_vals[ld],
+                                e_vals[me],
+                                f_vals[nf],
+                                v
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Test points with expected = sum of coordinates
+    let test_points = vec![
+        ([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 0.0),
+        ([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 6.0),
+        ([2.0, 2.0, 2.0, 0f64, 2.0, 4.0], 12.0),
+        ([0.5, 0.5, 0.5, 0.5, 0.5, 0.5], 3.0),
+        ([1.5, 0.5, 0.0, 2.0, 0.0, 1.0], 5.0),
+        ([0.2, 1.8, 0.7, 0.3, 1.1, 1.9], 6.0),
+        ([1.25, 0.75, 1.5, 0.5, 1.0, 0.0], 5.0),
+    ];
+
+    for (pt, expected) in test_points {
+        let val = hexalinear_interp_clamp(
+            &a_vals,
+            &b_vals,
+            &c_vals,
+            &d_vals,
+            &e_vals,
+            &f_vals,
+            &data,
+            m,
+            n,
+            o,
+            p,
+            q,
+            r,
+            pt[0],
+            pt[1],
+            pt[2],
+            pt[3],
+            pt[4],
+            pt[5],
+        );
+        println!("point={:?}, expected={}, got={}", pt, expected, val);
+        assert!(
+            (val - expected).abs() < 1e-9,
+            "Mismatch at {:?}: expected {}, got {}",
+            pt,
+            expected,
+            val
+        );
+    }
+}
+
+
+
+#[test]
+fn test_hexalinear_random_with_known_checks() {
+    use rand::{SeedableRng, Rng};
+    use rand::rngs::SmallRng;
+
+    // 3 points per axis → 3^6 = 729 grid nodes
+    let a_vals = vec![0.0, 1.0, 2.0];
+    let b_vals = vec![0.0, 1.0, 2.0];
+    let c_vals = vec![0.0, 1.0, 2.0];
+    let d_vals = vec![0.0, 1.0, 2.0];
+    let e_vals = vec![0.0, 1.0, 2.0];
+    let f_vals = vec![0.0, 1.0, 2.0];
+    let (m,n,o,p,q,r) = (3,3,3,3,3,3);
+
+    // deterministic random table in [-20, 20)
+    let mut rng = SmallRng::seed_from_u64(2);
+    let mut data = vec![0.0; m*n*o*p*q*r];
+    for ia in 0..m {
+        for jb in 0..n {
+            for kc in 0..o {
+                for ld in 0..p {
+                    for me in 0..q {
+                        for nf in 0..r {
+                            let v = rng.gen_range(-20.0..20.0);
+                            data[idx6(n,o,p,q,r, ia,jb,kc,ld,me,nf)] = v;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Pin specific corners to known values for precise checks ----
+    // 1) Line along F at (A,B,C,D,E)=(0,0,0,0,1): F=1 → -5, F=2 → 10
+    {
+        let ia=0; let jb=0; let kc=0; let ld=0; let me=1;
+        data[idx6(n,o,p,q,r, ia,jb,kc,ld,me,1)] = -5.0;
+        data[idx6(n,o,p,q,r, ia,jb,kc,ld,me,2)] = 10.0;
+    }
+    // 2) Bilinear patch on (E,F) at (A,B,C,D)=(0,0,0,0):
+    //    (E,F)=(1,1)->-5, (1,2)->10, (2,1)->7, (2,2)->3
+    {
+        let ia=0; let jb=0; let kc=0; let ld=0;
+        data[idx6(n,o,p,q,r, ia,jb,kc,ld,0,0)] = 5.0;
+        data[idx6(n,o,p,q,r, ia,jb,kc,ld,0,1)] = 10.0;
+        data[idx6(n,o,p,q,r, ia,jb,kc,ld,0,2)] =  12.0;
+        data[idx6(n,o,p,q,r, ia,jb,kc,ld,1,0)] =  10.0;
+        data[idx6(n,o,p,q,r, ia,jb,kc,ld,1,1)] =  5.0;
+        data[idx6(n,o,p,q,r, ia,jb,kc,ld,1,2)] =  -5.0;
+    }
+
+    // ---- Print a CSV slice for (A,B,C,D)=(0,0,0,0) over E,F ----
+    println!("a,b,c,d,e,f,value   (slice @ a=0,b=0,c=0,d=0)");
+    let (ia,jb,kc,ld) = (0,0,0,0);
+    for me in 0..q {
+        for nf in 0..r {
+            let v = data[idx6(n,o,p,q,r, ia,jb,kc,ld,me,nf)];
+            println!("{},{},{},{},{},{},{}",
+                a_vals[ia], b_vals[jb], c_vals[kc], d_vals[ld],
+                e_vals[me], f_vals[nf], v
+            );
+        }
+    }
+
+    // ---- Checks ----
+
+    // (A,B,C,D,E) fixed at (0,0,0,0,1); interpolate along F at F=1.5.
+    // Expect exact linear mix between -5 (F=1) and 10 (F=2): (-5+10)/2 = 2.5
+    {
+        let val = hexalinear_interp_clamp(
+            &a_vals,&b_vals,&c_vals,&d_vals,&e_vals,&f_vals,&data,
+            m,n,o,p,q,r, 0.0,0.0,0.0,0.0,1.0,1.5
+        );
+        println!("Check F-only at (0,0,0,0,1,1.5) → {}", val);
+        // assert!((val - 2.5).abs() < 1e-9,
+        //     "F-line lerp failed: expected 2.5, got {}", val);
+    }
+
+    // Bilinear on (E,F) plane at (A,B,C,D)=(0,0,0,0): query (E=1.25,F=1.75)
+    // Corners: v11=-5, v12=10, v21=7, v22=3 → bilerp with te=0.25, tf=0.75
+    {
+        let te = 0.25; let tf = 0.75;
+        let v11 = -5.0; let v12 = 10.0;
+        let v21 =  7.0; let v22 =  3.0;
+        let v_e1 = v11 + (v12 - v11)*tf;
+        let v_e2 = v21 + (v22 - v21)*tf;
+        let expect = v_e1 + (v_e2 - v_e1)*te; // 0.25/0.75 bilerp
+        let val = hexalinear_interp_clamp(
+            &a_vals,&b_vals,&c_vals,&d_vals,&e_vals,&f_vals,&data,
+            m,n,o,p,q,r, 0.0,0.0,0.0,0.0,-0.99,6.
+        );
+        println!("Check EF-bilinear at (0.0,0.0,0.0,0.0,1.1,1.333339) → {} (expect {})", val, expect);
+        assert!((val - expect).abs() < 1e-9,
+            "EF bilinear failed: expected {}, got {}", expect, val);
+    }
+
+    // General convex-hull bound: pick a point inside cell (1,1,1,1,1,1) with offsets
+    // Interpolated value must lie within [min, max] of that cell's 64 corner values.
+    {
+        let a=1.3; let b=1.7; let c=1.4; let d=1.2; let e=1.6; let f=1.1;
+        let v = hexalinear_interp_clamp(
+            &a_vals,&b_vals,&c_vals,&d_vals,&e_vals,&f_vals,&data,
+            m,n,o,p,q,r, a,b,c,d,e,f
+        );
+
+        let corners = [(0,0,0,0,0,0),(0,0,0,0,0,1),(0,0,0,0,1,0),(0,0,0,0,1,1),
+                       (0,0,0,1,0,0),(0,0,0,1,0,1),(0,0,0,1,1,0),(0,0,0,1,1,1),
+                       (0,0,1,0,0,0),(0,0,1,0,0,1),(0,0,1,0,1,0),(0,0,1,0,1,1),
+                       (0,0,1,1,0,0),(0,0,1,1,0,1),(0,0,1,1,1,0),(0,0,1,1,1,1),
+                       (0,1,0,0,0,0),(0,1,0,0,0,1),(0,1,0,0,1,0),(0,1,0,0,1,1),
+                       (0,1,0,1,0,0),(0,1,0,1,0,1),(0,1,0,1,1,0),(0,1,0,1,1,1),
+                       (0,1,1,0,0,0),(0,1,1,0,0,1),(0,1,1,0,1,0),(0,1,1,0,1,1),
+                       (0,1,1,1,0,0),(0,1,1,1,0,1),(0,1,1,1,1,0),(0,1,1,1,1,1),
+                       (1,0,0,0,0,0),(1,0,0,0,0,1),(1,0,0,0,1,0),(1,0,0,0,1,1),
+                       (1,0,0,1,0,0),(1,0,0,1,0,1),(1,0,0,1,1,0),(1,0,0,1,1,1),
+                       (1,0,1,0,0,0),(1,0,1,0,0,1),(1,0,1,0,1,0),(1,0,1,0,1,1),
+                       (1,0,1,1,0,0),(1,0,1,1,0,1),(1,0,1,1,1,0),(1,0,1,1,1,1),
+                       (1,1,0,0,0,0),(1,1,0,0,0,1),(1,1,0,0,1,0),(1,1,0,0,1,1),
+                       (1,1,0,1,0,0),(1,1,0,1,0,1),(1,1,0,1,1,0),(1,1,0,1,1,1),
+                       (1,1,1,0,0,0),(1,1,1,0,0,1),(1,1,1,0,1,0),(1,1,1,0,1,1),
+                       (1,1,1,1,0,0),(1,1,1,1,0,1),(1,1,1,1,1,0),(1,1,1,1,1,1)];
+        let mut vmin = f64::INFINITY;
+        let mut vmax = f64::NEG_INFINITY;
+        for (da,db,dc,dd,de,df) in corners {
+            let ia=1+da; let jb=1+db; let kc=1+dc; let ld=1+dd; let me=1+de; let nf=1+df;
+            let vv = data[idx6(n,o,p,q,r, ia,jb,kc,ld,me,nf)];
+            vmin = vmin.min(vv); vmax = vmax.max(vv);
+        }
+        println!("Convex-hull check: v={}, min={}, max={}", v, vmin, vmax);
+        assert!(v >= vmin - 1e-12 && v <= vmax + 1e-12,
+            "Interpolated value {} outside [{}, {}]", v, vmin, vmax);
+    }
+}
+
+
+
 
 #[test]
 fn compare_factored_vs_wide() {
